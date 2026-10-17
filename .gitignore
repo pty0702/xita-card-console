@@ -23,3 +23,4 @@ artifacts/
 *.err.txt
 客户端壳-演示/
 客户测试包/
+.agents/skills/xita-card-console-release/private/

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mac 西塔卡密打包"
+  short_description: "使用独立 Mac 卡密服务接入程序、打包交付并自动初始化新电脑 SSH"
+  default_prompt: "用 $xita-card-console-release，将当前程序接入 Mac 卡密后台并打包成卡密验证版。"
