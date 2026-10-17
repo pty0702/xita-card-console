@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from common import crypto, config  # noqa: E402
+from common import crypto, config, ed25519  # noqa: E402
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -260,6 +260,7 @@ class Handler(socketserver.BaseRequestHandler):
                 packet = head + rest
                 cmd = struct.unpack_from("<I", packet, 10)[0]
                 sealed = packet[14:]
+                challenge = ""
                 try:
                     plain = crypto.unseal(config.KEY, sealed)
                     text = plain.decode("gbk", "replace")
@@ -271,8 +272,32 @@ class Handler(socketserver.BaseRequestHandler):
                 elif not text:
                     reply_text = "非法数据001"
                 else:
-                    reply_text = dispatch(text, peer)
-                reply = crypto.pack_reply(crypto.seal(config.KEY, reply_text.encode("gbk")))
+                    base, challenge, client_ts = crypto.split_challenge(text)
+                    if challenge:
+                        now = int(time.time())
+                        if abs(now - client_ts) > config.TS_WINDOW:
+                            reply_text = "非法数据012"      # 请求时间戳过期
+                        else:
+                            reply_text = dispatch(base, peer)
+                            # 验证成功时，附带一个「服务器签名过的本地授权」
+                            # 客户端离线只验公钥签名 → 拿对称 KEY 也造不出可用的 license.dat
+                            if reply_text.startswith("验证成功") and base.startswith("验证33|"):
+                                parts = base.split("|")
+                                card_ = parts[1] if len(parts) > 1 else ""
+                                machine_ = parts[2] if len(parts) > 2 else ""
+                                exp_ = ""
+                                for seg in reply_text.split("|")[1:]:
+                                    if seg.startswith("到期时间:"):
+                                        exp_ = seg.split(":", 1)[1]
+                                        break
+                                lic_msg = ("%s|%s|%s" % (card_, machine_, exp_)).encode("gbk")
+                                lic_sig = ed25519.sign(PRIVATE_KEY, lic_msg)
+                                reply_text += "|授权=" + lic_sig.hex()
+                    else:
+                        reply_text = "非法数据013"           # 协议版本过旧（没带挑战值）
+                # 回包带上签名：文本 | 挑战值 | 时间戳 | Ed25519 签名
+                signed = crypto.sign_reply(PRIVATE_KEY, reply_text, challenge or "0" * 32)
+                reply = crypto.pack_reply(crypto.seal(config.KEY, signed))
                 sock.sendall(reply)
                 log("应答 %s -> %s" % (peer, reply_text[:80]))
         except Exception as e:
@@ -284,8 +309,48 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def load_private_key() -> bytes:
+    path = os.path.join(config.KEY_DIR, "server_ed25519.key")
+    if not os.path.isfile(path):
+        raise SystemExit("缺少签名私钥：%s（先跑 tools/gen_keys.py）" % path)
+    raw = open(path, "rb").read().strip()
+    try:
+        key = bytes.fromhex(raw.decode("ascii"))
+    except Exception:
+        key = raw
+    if len(key) != 32:
+        raise SystemExit("签名私钥长度不对（要 32 字节）")
+    return key
+
+
+def build_ssl_context():
+    import ssl
+    cert = os.path.join(config.KEY_DIR, "server.crt")
+    key = os.path.join(config.KEY_DIR, "server.key")
+    if not (os.path.isfile(cert) and os.path.isfile(key)):
+        raise SystemExit("缺少 TLS 证书：%s" % cert)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert, key)
+    return ctx
+
+
+PRIVATE_KEY = b"\x00" * 32
+
+
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default=config.HOST)
+    ap.add_argument("--port", type=int, default=config.PORT)
+    ap.add_argument("--no-tls", action="store_true")
+    args = ap.parse_args()
     init_db()
-    port = config.PORT
-    log("西塔验证壳服务端启动 0.0.0.0:%d  数据库 %s" % (port, config.DB_PATH))
-    Server(("0.0.0.0", port), Handler).serve_forever()
+    PRIVATE_KEY = load_private_key()
+    log("西塔验证壳服务端启动 %s:%d（TLS=%s，签名公钥 %s…）数据库 %s"
+        % (args.host, args.port, (config.USE_TLS and not args.no_tls),
+           config.PUBLIC_KEY_HEX[:16], config.DB_PATH))
+    srv = Server((args.host, args.port), Handler)
+    if config.USE_TLS and not args.no_tls:
+        srv.socket = build_ssl_context().wrap_socket(srv.socket, server_side=True)
+    srv.serve_forever()

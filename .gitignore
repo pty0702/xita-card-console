@@ -11,6 +11,7 @@ __pycache__/
 *.ini
 license.dat
 keys/
+common/config.py
 admin/config.json
 admin/local.*.txt
 server/data/
@@ -18,3 +19,7 @@ build*/
 dist*/
 artifacts/
 运维-*.md
+*.out.txt
+*.err.txt
+客户端壳-演示/
+客户测试包/
