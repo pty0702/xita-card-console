@@ -28,7 +28,7 @@ ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from common import crypto, config, runtime  # noqa: E402
+from common import crypto, config, runtime, tls  # noqa: E402
 
 
 def machine_code() -> str:
@@ -46,24 +46,7 @@ def machine_code() -> str:
     return hashlib.md5(os.environ.get("COMPUTERNAME", "pc").encode()).hexdigest()[:19].upper()
 
 
-def _tls_connect(host, port, timeout):
-    """TLS 连接 + 证书指纹 pin（防中间人）"""
-    raw = socket.create_connection((host, port), timeout)
-    if not config.USE_TLS:
-        return raw
-    import ssl
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    s = ctx.wrap_socket(raw, server_hostname=host)
-    pin = (config.CERT_SHA256 or "").lower()
-    if pin:
-        got = hashlib.sha256(s.getpeercert(binary_form=True) or b"").hexdigest()
-        if got != pin:
-            s.close()
-            raise IOError("服务器证书指纹不匹配（疑似中间人）")
-    return s
+_tls_connect = tls.connect
 
 
 def rpc(host, port, text, timeout=6.0) -> str:

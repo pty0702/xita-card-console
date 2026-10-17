@@ -7,7 +7,7 @@
 - Web 管理后台：生成时间卡、永久卡与点数卡，搜索、状态筛选、续期、解绑、封禁、批量操作、日志及 CSV 导出。
 - 授权校验：设备绑定、到期检查、点数扣减；HTTP 与 TCP 校验使用同一卡库和写事务。
 - 通信：TLS、证书指纹校验、服务器 Ed25519 回包签名、请求挑战值与时间戳校验。
-- 客户端：在线验证、服务器签名授权缓存、加密程序体启动；保留历史授权格式的兼容逻辑。
+- 客户端：在线验证、包含卡种的 SIG2 签名授权缓存、加密程序体启动；点数卡仅允许在线使用。
 
 ## 首次准备
 
@@ -19,6 +19,16 @@
 4. 服务器保管 keys/server_ed25519.key、server.key 与 server.crt；客户端只需要验签公钥、证书指纹及兼容的通信配置。
 
 Python 业务代码使用标准库。生成 TLS 证书需要 OpenSSL，Git for Windows 可提供。Windows 静默测试程序使用 PowerShell 7 与系统 .NET Framework v4 编译器构建。
+
+## 安全升级与旧缓存
+
+本项目沿用已有本地时间凭证模式（LICENSE_INTEGRATION_MODE=time-credential）。SIG2 签名绑定卡号、设备、到期时间和卡种；客户端拒绝 SIG1、HMA1 和无魔数旧缓存，旧缓存需要重新在线验证。点数卡每次启动必须在线扣点，不签发或保留离线授权。
+
+服务端与客户端必须配套升级：先更新服务端，再分发重新打包的客户端，沿用现有密钥和证书。旧客户端及旧 EXE 不会因源码更新而自动获得修复。
+
+启用 TLS 时，客户端要求配置有效的 64 位十六进制证书指纹；缺失、格式错误或指纹不匹配均拒绝连接。服务端在工作线程中握手，握手超时为 10 秒。USE_TLS=False 和 --no-tls 仅用于显式关闭 TLS 的本机开发。
+
+本次未增加可信时钟或在线租约；离线时间卡到期仍依赖本机时间检查，不保证抵御系统时钟回拨，也不能实时获知后台封禁或解绑。
 
 ## 启动
 
@@ -38,6 +48,8 @@ python server/vps_server.py --host 127.0.0.1 --port 9000
 python tools/test_admin_ui.py
 python common/ed25519.py
 python tools/test_signed_protocol.py
+python tools/test_tls_client.py
+python tools/test_server_security.py
 pwsh -NoProfile -File tools/build_test_payload.ps1
 python tools/test_payload.py
 ~~~

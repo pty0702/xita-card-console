@@ -285,14 +285,17 @@ class Handler(socketserver.BaseRequestHandler):
                                 parts = base.split("|")
                                 card_ = parts[1] if len(parts) > 1 else ""
                                 machine_ = parts[2] if len(parts) > 2 else ""
-                                exp_ = ""
+                                exp_, kind_ = "", ""
                                 for seg in reply_text.split("|")[1:]:
                                     if seg.startswith("到期时间:"):
                                         exp_ = seg.split(":", 1)[1]
-                                        break
-                                lic_msg = ("%s|%s|%s" % (card_, machine_, exp_)).encode("gbk")
-                                lic_sig = ed25519.sign(PRIVATE_KEY, lic_msg)
-                                reply_text += "|授权=" + lic_sig.hex()
+                                    elif seg.startswith("授权类型:"):
+                                        kind_ = seg.split(":", 1)[1]
+                                # 点数卡必须逐次在线扣点；SIG2 把类型纳入签名，禁止改成永久卡。
+                                if kind_ in ("时间卡", "永久卡", "试用") and exp_:
+                                    lic_msg = ("%s|%s|%s|%s" % (card_, machine_, exp_, kind_)).encode("gbk")
+                                    lic_sig = ed25519.sign(PRIVATE_KEY, lic_msg)
+                                    reply_text += "|授权=" + lic_sig.hex()
                     else:
                         reply_text = "非法数据013"           # 协议版本过旧（没带挑战值）
                 # 回包带上签名：文本 | 挑战值 | 时间戳 | Ed25519 签名
@@ -307,6 +310,21 @@ class Handler(socketserver.BaseRequestHandler):
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    ssl_context = None
+    handshake_timeout = 10
+
+    def finish_request(self, request, client_address):
+        if self.ssl_context is None:
+            return super().finish_request(request, client_address)
+        # 握手属于工作线程，慢连接不能阻塞主线程接收其他客户端。
+        request.settimeout(self.handshake_timeout)
+        try:
+            with self.ssl_context.wrap_socket(request, server_side=True) as secured:
+                self.RequestHandlerClass(secured, client_address, self)
+        except OSError as exc:
+            log("TLS 连接失败 %s:%d: %r" % (*client_address, exc))
+        finally:
+            request.close()
 
 
 def load_private_key() -> bytes:
@@ -350,7 +368,7 @@ if __name__ == "__main__":
     log("西塔验证壳服务端启动 %s:%d（TLS=%s，签名公钥 %s…）数据库 %s"
         % (args.host, args.port, (config.USE_TLS and not args.no_tls),
            config.PUBLIC_KEY_HEX[:16], config.DB_PATH))
-    srv = Server((args.host, args.port), Handler)
-    if config.USE_TLS and not args.no_tls:
-        srv.socket = build_ssl_context().wrap_socket(srv.socket, server_side=True)
-    srv.serve_forever()
+    with Server((args.host, args.port), Handler) as srv:
+        if config.USE_TLS and not args.no_tls:
+            srv.ssl_context = build_ssl_context()
+        srv.serve_forever()

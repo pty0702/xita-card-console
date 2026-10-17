@@ -6,7 +6,7 @@
 特点（和"origin2026激活补丁"同款体验）：
   * 卡密框 / 公告栏 / 记住卡密 / 自动登录 / 换绑
   * 机器码取 C: 卷序列号
-  * 登录成功写 license.dat（HMAC 签名，含到期时间），下次可离线启动
+  * 时间/永久/试用卡登录成功写服务器签名的 SIG2 授权，点数卡每次在线验证
   * 真正的程序是加密的 payload.bin，验证通过才解密释放并启动
 
 用法：
@@ -15,8 +15,8 @@
 """
 import argparse
 import ctypes
+from datetime import datetime
 import hashlib
-import hmac
 import os
 import random
 import socket
@@ -31,7 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from common import crypto, config, runtime  # noqa: E402
+from common import crypto, config, runtime, tls  # noqa: E402
 
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 INI = os.path.join(APP_DIR, "用户配置.ini")
@@ -54,26 +54,7 @@ def machine_code() -> str:
 
 
 # ---------------- 通讯 ----------------
-def _tls_connect(host, port, timeout):
-    """建立 TLS 连接并校验服务器证书指纹（pin）"""
-    raw = socket.create_connection((host, port), timeout)
-    if not config.USE_TLS:
-        return raw
-    import hashlib as _h
-    import ssl
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE      # 自己校验指纹，不走 CA
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    s = ctx.wrap_socket(raw, server_hostname=host)
-    pin = (config.CERT_SHA256 or "").lower()
-    if pin:
-        der = s.getpeercert(binary_form=True) or b""
-        got = _h.sha256(der).hexdigest()
-        if got != pin:
-            s.close()
-            raise IOError("服务器证书指纹不匹配（疑似中间人）")
-    return s
+_tls_connect = tls.connect
 
 
 class Client:
@@ -135,62 +116,74 @@ def write_ini(cfg):
             f.write("%s=%s\n" % (k, cfg.get(k, "")))
 
 
-def save_license(card, machine, expire_text, server_sig_hex=""):
-    """保存本地授权。
+def _license_message(card, machine, expire_text, kind):
+    """严格限定离线卡种及到期字段，签名同时绑定卡种。"""
+    fields = (card, machine, expire_text, kind)
+    if any(not isinstance(value, str) or not value or "|" in value for value in fields):
+        raise ValueError("授权字段缺失或无效")
+    if kind == "永久卡":
+        if expire_text != "永久":
+            raise ValueError("永久卡授权到期字段无效")
+    elif kind in ("时间卡", "试用"):
+        fmt = "%Y-%m-%d %H:%M:%S"
+        expires = datetime.strptime(expire_text, fmt)
+        if expires.strftime(fmt) != expire_text or time.time() > expires.timestamp():
+            raise ValueError("授权已过期或到期字段无效")
+    else:
+        raise ValueError("此卡种不支持离线授权")
+    return "|".join(fields).encode("gbk")
 
-    server_sig_hex 是服务器用 Ed25519 私钥签的授权签名（verify 连接成功后由服务器下发）。
-    本地只用公钥验签 —— 所以就算别人拿到对称 KEY，也造不出一份能用的 license.dat。
-    没有服务器签名时退回 HMAC（仅兼容老服务器）。
-    """
-    msg = "|".join([card, machine, expire_text]).encode("gbk")
-    if server_sig_hex:
-        try:
-            sig = bytes.fromhex(server_sig_hex)
-            if len(sig) == 64:
-                with open(LIC, "wb") as f:
-                    f.write(b"SIG1" + len(msg).to_bytes(4, "little") + msg + sig)
-                return True
-        except Exception:
-            pass
-    sig = crypto.sign(config.KEY, msg)
+
+def save_license(card, machine, expire_text, server_sig_hex="", kind=""):
+    """只保存公钥验证通过的 SIG2 授权；缺少或损坏签名时拒绝。"""
+    try:
+        msg = _license_message(card, machine, expire_text, kind)
+        sig = bytes.fromhex(server_sig_hex)
+        if not crypto.ed25519.verify(bytes.fromhex(config.PUBLIC_KEY_HEX), msg, sig):
+            return False
+    except (ValueError, TypeError, OverflowError):
+        return False
     with open(LIC, "wb") as f:
-        f.write(b"HMA1" + len(msg).to_bytes(4, "little") + msg + sig)
-    return False
+        f.write(b"SIG2" + len(msg).to_bytes(4, "little") + msg + sig)
+    return True
 
 
 def load_license(machine):
     if not os.path.isfile(LIC):
         return None
     try:
-        raw = open(LIC, "rb").read()
-        if raw[:4] == b"SIG1":
-            n = int.from_bytes(raw[4:8], "little")
-            msg, sig = raw[8:8 + n], raw[8 + n:]
-            pk = bytes.fromhex(config.PUBLIC_KEY_HEX)
-            if not crypto.ed25519.verify(pk, msg, sig):
-                return None
-        elif raw[:4] == b"HMA1":
-            n = int.from_bytes(raw[4:8], "little")
-            msg, sig = raw[8:8 + n], raw[8 + n:]
-            if not crypto.verify(config.KEY, msg, sig):
-                return None
-        else:            # 老格式（无魔数）
-            n = int.from_bytes(raw[:4], "little")
-            msg, sig = raw[4:4 + n], raw[4 + n:]
-            if not crypto.verify(config.KEY, msg, sig):
-                return None
-        card, m, expire_text = msg.decode("gbk").split("|", 2)
+        with open(LIC, "rb") as f:
+            raw = f.read()
+        if raw[:4] != b"SIG2":
+            return None
+        n = int.from_bytes(raw[4:8], "little")
+        if len(raw) != 8 + n + 64:
+            return None
+        msg, sig = raw[8:8 + n], raw[8 + n:]
+        if not crypto.ed25519.verify(bytes.fromhex(config.PUBLIC_KEY_HEX), msg, sig):
+            return None
+        card, m, expire_text, kind = msg.decode("gbk").split("|")
         if m != machine:
             return None
-        if expire_text and expire_text != "永久":
-            try:
-                if time.time() > time.mktime(time.strptime(expire_text, "%Y-%m-%d %H:%M:%S")):
-                    return None
-            except Exception:
-                return None
+        _license_message(card, m, expire_text, kind)
         return (card, expire_text)
     except Exception:
         return None
+
+
+def accept_online_license(text, card, machine):
+    """GUI/CLI 共用：在线成功后验证授权；点数卡只允许本次在线启动。"""
+    parts = dict(p.split(":", 1) for p in text.split("|")[1:] if ":" in p)
+    if parts.get("授权类型") == "点数卡":
+        if os.path.isfile(LIC):
+            os.remove(LIC)
+        return True, "点数卡本次在线验证通过，不保存离线授权"
+    signature = next((seg.split("=", 1)[1] for seg in text.split("|")
+                      if seg.startswith("授权=")), "")
+    if not save_license(card, machine, parts.get("到期时间", ""), signature,
+                        parts.get("授权类型", "")):
+        return False, "服务器授权签名缺失或无效，请重新在线验证"
+    return True, "已保存本地授权 license.dat"
 
 
 # ---------------- 释放并启动被保护程序 ----------------
@@ -305,16 +298,18 @@ def run_gui():
     def done(txt, card):
         result["txt"] = txt
         if txt.startswith("验证成功"):
+            try:
+                accepted, info = accept_online_license(txt, card, mc)
+            except OSError as e:
+                accepted, info = False, "保存授权失败：%s" % e
+            if not accepted:
+                messagebox.showerror("【网络验证提示】", info)
+                status.set(info)
+                return
             cfg2 = {"记住用户": "真" if var_remember.get() else "假",
                     "自动登录": "真" if var_auto.get() else "假",
                     "卡号": card if var_remember.get() else ""}
             write_ini(cfg2)
-            parts = dict(p.split(":", 1) for p in txt.split("|")[1:] if ":" in p)
-            lic_sig = ""
-            for seg in txt.split("|"):
-                if seg.startswith("授权="):
-                    lic_sig = seg.split("=", 1)[1]
-            save_license(card, mc, parts.get("到期时间", ""), lic_sig)
             messagebox.showinfo("信息：", txt.replace("|", "\n"))
             ok, info = launch_payload()
             status.set(info if not ok else "已启动被保护程序")
@@ -389,14 +384,14 @@ def run_cli(card, offline=False, host=None, port=None, verify_only=False):
         return 1
     print("服务器回复：%s" % txt)
     if txt.startswith("验证成功"):
-        parts = dict(p.split(":", 1) for p in txt.split("|")[1:] if ":" in p)
-        lic_sig = ""
-        for seg in txt.split("|"):
-            if seg.startswith("授权="):
-                lic_sig = seg.split("=", 1)[1]
-        save_license(card, mc, parts.get("到期时间", ""), lic_sig)
+        try:
+            accepted, info = accept_online_license(txt, card, mc)
+        except OSError as e:
+            accepted, info = False, "保存授权失败：%s" % e
+        print(info)
+        if not accepted:
+            return 2
         write_ini({"记住用户": "真", "自动登录": "真", "卡号": card})
-        print("已保存本地授权 license.dat")
         if verify_only:
             print("在线验证通过，未启动被保护程序")
             return 0
