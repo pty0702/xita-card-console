@@ -6,6 +6,9 @@
       try { return root.querySelector(selector); } catch { return null; }
     };
     const createForm = find("#create-form");
+    const batchForm = find("#batch-form");
+    const rowChecks = batchForm ? Array.from(batchForm.elements).filter(input =>
+      input.matches(".row-check") && !input.disabled) : [];
     const dialog = find("#confirm-dialog");
     const submissions = new Map();
     const approved = new WeakSet();
@@ -130,6 +133,19 @@
       });
     }
 
+    function updateBatch() {
+      const count = rowChecks.filter(input => input.checked).length;
+      const all = find("#check-all");
+      if (all) {
+        all.checked = rowChecks.length > 0 && count === rowChecks.length;
+        all.indeterminate = count > 0 && count < rowChecks.length;
+        all.disabled = rowChecks.length === 0;
+      }
+      const counter = find("#batch-count");
+      if (counter) counter.textContent = "已选 " + count + " 张";
+      return count;
+    }
+
     function cancelConfirmation() {
       const action = pending;
       pending = null;
@@ -194,8 +210,20 @@
         form.reportValidity();
         return;
       }
+      const selected = form === batchForm ? updateBatch() : null;
+      if (selected === 0) {
+        event.preventDefault();
+        notify("请先选择要操作的卡密");
+        return;
+      }
       if (form.hasAttribute("data-confirm") && !approved.delete(form)) {
-        const message = form.dataset.confirm || "确定执行此操作？";
+        let message = form.dataset.confirm || "确定执行此操作？";
+        if (form === batchForm) {
+          const operation = find('[name="act"]', form);
+          const label = operation?.selectedOptions[0]?.textContent.trim() || "批量操作";
+          message = "确定对已选的 " + selected + " 张卡密执行「" + label + "」？";
+          if (operation?.value === "delete") message += "删除后不可恢复。";
+        }
         if (dialog && typeof dialog.showModal === "function") {
           event.preventDefault();
           cancelConfirmation();
@@ -295,7 +323,12 @@
           event.target.matches('[name="num"],[name="days"],[name="points"]')) updateCreate();
     });
     document.addEventListener("change", event => {
-      if (event.target instanceof Element && createForm?.contains(event.target) &&
+      if (!(event.target instanceof Element)) return;
+      if (event.target.matches("#check-all")) {
+        rowChecks.forEach(input => { input.checked = event.target.checked; });
+        updateBatch();
+      } else if (event.target.matches(".row-check")) updateBatch();
+      if (createForm?.contains(event.target) &&
           event.target.matches('[name="kind"]')) updateCreate();
     });
     document.addEventListener("keydown", event => {
@@ -321,6 +354,7 @@
         });
       });
       submissions.clear();
+      updateBatch();
     });
 
     if (createForm) {
@@ -335,6 +369,7 @@
     }
     const logFilter = find("[data-filter-log]");
     if (logFilter) filterLogs(logFilter);
+    updateBatch();
     toggleMenu(false);
   }
 

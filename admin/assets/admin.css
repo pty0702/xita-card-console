@@ -308,6 +308,12 @@ dialog.confirm-dialog p { margin-bottom: 23px; color: var(--muted); font-size: 1
 .toolbar { justify-content: flex-start; }
 .toolbar-count { margin-left: auto; color: var(--muted); font-size: 12px; }
 .toolbar-count strong { margin: 0 3px; color: var(--muted); font-weight: 550; font-variant-numeric: tabular-nums; }
+.batch-toolbar { gap: 10px 16px; }
+.batch-check-all { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding-inline: 6px; cursor: pointer; white-space: nowrap; }
+.batch-check-all input, input.row-check { width: 18px; min-width: 18px; min-height: 18px; height: 18px; padding: 0; cursor: pointer; }
+.batch-toolbar #batch-count { margin-right: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.batch-toolbar select { flex: 1 1 190px; width: auto; max-width: 240px; }
+.batch-toolbar .button { flex: none; }
 .panel > .tabs { padding: 10px 24px 0; border-bottom: 1px solid #edf0f6; }
 .panel > .tabs .tab { position: relative; min-height: 49px; padding: 11px 17px 14px; border-radius: 0; }
 .panel > .tabs .tab.active { background: transparent; }
@@ -428,6 +434,7 @@ textarea.result-list { display: block; max-height: none; padding: 16px 18px; col
   .search-field { width: 100%; }
   input, select, textarea, .search-field input, textarea.result-list { font-size: 16px; }
   .toolbar > form { width: 100%; }
+  .batch-toolbar select { max-width: none; }
   .tabs { gap: 2px; }
   .tab { padding-inline: 11px; font-size: 12px; }
   .panel-footer { gap: 10px; }

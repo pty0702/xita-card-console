@@ -49,19 +49,53 @@ STATE = {"conf": None}
 
 
 # ---------------- 配置 ----------------
+PBKDF2_ROUNDS = 260000
+
+
+def _hash_pbkdf2(pwd: str, salt: str = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pwd.encode(), salt.encode(), PBKDF2_ROUNDS)
+    return "pbkdf2_sha256$%d$%s$%s" % (PBKDF2_ROUNDS, salt, dk.hex())
+
+
+def _verify_pbkdf2(stored: str, pwd: str) -> bool:
+    try:
+        algo, rounds, salt, expect = stored.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", pwd.encode(), salt.encode(), int(rounds))
+        return hmac.compare_digest(dk.hex(), expect)
+    except Exception:
+        return False
+
+
+def save_conf(c):
+    json.dump(c, open(CONF, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    try:
+        os.chmod(CONF, 0o600)
+    except Exception:
+        pass
+    STATE["conf"] = c
+    return c
+
+
 def load_conf():
     if STATE["conf"]:
         return STATE["conf"]
     if os.path.isfile(CONF):
         c = json.load(open(CONF, "r", encoding="utf-8"))
+        # 老配置只有 password_sha256：保留原样，等下次登录成功时再原地升级成 PBKDF2
+        if "password_pbkdf2" not in c and c.get("password_sha256"):
+            c["password_sha256_legacy"] = c.pop("password_sha256")
+            save_conf(c)
     else:
         pwd = "xita2026"
         c = {
-            "password_sha256": hashlib.sha256(pwd.encode()).hexdigest(),
+            "password_pbkdf2": _hash_pbkdf2(pwd),
             "secret": secrets.token_hex(32),
             "site": "西塔验证壳 · 卡密管理平台",
         }
-        json.dump(c, open(CONF, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        save_conf(c)
         print("=" * 60)
         print(" 首次启动，已生成管理后台账号")
         print(" 用户名：admin")
@@ -73,8 +107,27 @@ def load_conf():
 
 
 def check_password(pwd: str) -> bool:
+    """PBKDF2 优先；老 sha256 命中则自动升级存储格式"""
     c = load_conf()
-    return hmac.compare_digest(hashlib.sha256(pwd.encode()).hexdigest(), c["password_sha256"])
+    if c.get("password_pbkdf2"):
+        return _verify_pbkdf2(c["password_pbkdf2"], pwd)
+    legacy = c.get("password_sha256_legacy") or c.get("password_sha256")
+    if legacy and hmac.compare_digest(hashlib.sha256(pwd.encode()).hexdigest(), legacy):
+        c["password_pbkdf2"] = _hash_pbkdf2(pwd)
+        c.pop("password_sha256_legacy", None)
+        c.pop("password_sha256", None)
+        save_conf(c)
+        return True
+    return False
+
+
+def set_password(pwd: str):
+    c = load_conf()
+    c["password_pbkdf2"] = _hash_pbkdf2(pwd)
+    c.pop("password_sha256_legacy", None)
+    c.pop("password_sha256", None)
+    c["secret"] = secrets.token_hex(32)      # 换密码同时轮换 secret，旧会话全部失效
+    return save_conf(c)
 
 
 def make_token() -> str:
@@ -84,6 +137,53 @@ def make_token() -> str:
 
 def token_ok(tok: str) -> bool:
     return bool(tok) and hmac.compare_digest(tok, make_token())
+
+
+def csrf_token() -> str:
+    c = load_conf()
+    return hmac.new(c["secret"].encode(), b"csrf", hashlib.sha256).hexdigest()
+
+
+def csrf_field() -> str:
+    return '<input type="hidden" name="csrf" value="%s">' % csrf_token()
+
+
+# ---- 登录失败限制 ----
+LOGIN_MAX_FAIL = 5
+LOGIN_LOCK_SECONDS = 600
+
+
+def login_locked(ip: str):
+    now = int(time.time())
+    with db() as conn:
+        conn.execute("DELETE FROM auth_fails WHERE ts<?", (now - LOGIN_LOCK_SECONDS,))
+        n = conn.execute("SELECT COUNT(*) FROM auth_fails WHERE ip=?", (ip,)).fetchone()[0]
+    return n >= LOGIN_MAX_FAIL
+
+
+def login_fail(ip: str):
+    with db() as conn:
+        conn.execute("INSERT INTO auth_fails(ip,ts) VALUES(?,?)", (ip, int(time.time())))
+
+
+def login_reset(ip: str):
+    with db() as conn:
+        conn.execute("DELETE FROM auth_fails WHERE ip=?", (ip,))
+
+
+# ---- 校验接口限流（每 IP 每分钟 120 次）----
+API_MAX_PER_MIN = 120
+
+
+def api_allowed(ip: str) -> bool:
+    now = int(time.time())
+    with db() as conn:
+        conn.execute("DELETE FROM api_hits WHERE ts<?", (now - 60,))
+        n = conn.execute("SELECT COUNT(*) FROM api_hits WHERE ip=?", (ip,)).fetchone()[0]
+        if n >= API_MAX_PER_MIN:
+            return False
+        conn.execute("INSERT INTO api_hits(ip,ts) VALUES(?,?)", (ip, now))
+    return True
 
 
 # ---------------- 数据库 ----------------
@@ -110,6 +210,10 @@ def db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, card TEXT,
         machine TEXT, action TEXT, detail TEXT
     );
+    CREATE TABLE IF NOT EXISTS auth_fails (ip TEXT, ts INTEGER);
+    CREATE TABLE IF NOT EXISTS api_hits (ip TEXT, ts INTEGER);
+    CREATE INDEX IF NOT EXISTS idx_auth_fails ON auth_fails(ip, ts);
+    CREATE INDEX IF NOT EXISTS idx_api_hits ON api_hits(ip, ts);
     """)
     return conn
 
@@ -156,9 +260,18 @@ def create_cards(num, kind, days, points, note):
     return made
 
 
+CARD_ACTIONS = {
+    "ban": "封禁", "unban": "解封", "unbind": "解绑", "reset": "重置",
+    "delete": "删除", "renew:30": "续期 30 天", "renew:365": "续期 365 天",
+}
+
+
 def do_action(card, act):
-    now = int(time.time())
+    if act not in CARD_ACTIONS:
+        raise ValueError("不支持的卡密操作")
     with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        now = int(time.time())
         r = conn.execute("SELECT * FROM cards WHERE card=?", (card,)).fetchone()
         if not r:
             return "卡不存在"
@@ -191,10 +304,36 @@ def do_action(card, act):
     return msg
 
 
+def do_batch(cards, act):
+    """同批次卡号去重，返回成功数、跳过数与结果说明。"""
+    if act not in CARD_ACTIONS:
+        raise ValueError("不支持的批量操作")
+    if len(cards) > 2000:
+        raise ValueError("一次最多处理 2000 张卡密，请分批操作")
+    done, skipped = 0, 0
+    for c in dict.fromkeys((card or "").strip() for card in cards):
+        if not c or len(c) != config.CARD_LEN:
+            skipped += 1
+            continue
+        try:
+            msg = do_action(c, act)
+            if msg in ("卡不存在", "未知操作"):
+                skipped += 1
+            else:
+                done += 1
+        except sqlite3.Error:
+            skipped += 1
+    return done, skipped, "批量%s：成功 %d 张，跳过 %d 张" % (CARD_ACTIONS[act], done, skipped)
+
+
 def verify_card(card, machine):
     """给 HTTP 校验接口用：返回 (ok, message, extra)"""
-    now = int(time.time())
+    if not machine or not machine.strip():
+        return False, "缺少设备标识.", {}
     with db() as conn:
+        # 在读取前取得写事务，HTTP 与 TCP 验证共享同一数据库锁。
+        conn.execute("BEGIN IMMEDIATE")
+        now = int(time.time())
         r = conn.execute("SELECT * FROM cards WHERE card=?", (card,)).fetchone()
         if not r:
             return False, "卡号不存在.", {}
@@ -204,9 +343,9 @@ def verify_card(card, machine):
             return False, "卡号未登录或已经到期.", {}
         if r["kind"] == "点数卡" and r["points"] <= 0:
             return False, "卡号点数已用完.", {}
-        if r["bound_machine"] and machine and r["bound_machine"] != machine:
+        if r["bound_machine"] and r["bound_machine"] != machine:
             return False, "当前用户已登录到其他设备.", {}
-        if not r["bound_machine"] and machine:
+        if not r["bound_machine"]:
             conn.execute("UPDATE cards SET bound_machine=?, bound_at=?, bind_count=bind_count+1 WHERE card=?",
                          (machine, now, card))
         if r["kind"] == "点数卡":
@@ -248,7 +387,8 @@ def page(title, body, user=None):
     nav = ""
     if user:
         links = [("/", "grid", "数据概览", "概览"), ("/cards", "card", "卡密管理", "卡密列表"),
-                 ("/new", "plus", "生成卡密", "生成卡密"), ("/logs", "logs", "操作日志", "日志")]
+                 ("/new", "plus", "生成卡密", "生成卡密"), ("/logs", "logs", "操作日志", "日志"),
+                 ("/settings", "shield", "设置与安全", "设置")]
         items = "".join('<a class="nav-link %s" href="%s" %s>%s<span>%s</span></a>' % (
             "active" if title == key or (href == "/cards" and title == "卡密详情") or (href == "/new" and title == "生成结果") else "",
             href, 'aria-current="page"' if title == key else "", icon(symbol), label)
@@ -303,7 +443,7 @@ def copy_button(value):
 def action_form(card, action, label, tone="secondary", message=""):
     url = "/card/" + urllib.parse.quote(card, safe="") + "/act"
     confirm = f' data-confirm="{html.escape(message, quote=True)}"' if message else ""
-    return f'<form method="post" action="{url}"{confirm}><input type="hidden" name="act" value="{action}"><button class="button {tone} small" type="submit">{label}</button></form>'
+    return f'<form method="post" action="{url}"{confirm}>{csrf_field()}<input type="hidden" name="act" value="{action}"><button class="button {tone} small" type="submit">{label}</button></form>'
 
 
 def log_rows(rows, with_card=True):
@@ -325,7 +465,7 @@ def view_login(err=""):
       <div class="login-visual" aria-hidden="true"><div class="visual-orbit"></div><div class="visual-card visual-card-back"></div><div class="visual-card"><div class="visual-card-top"><span>XITA / ACCESS</span>{icon("shield")}</div><div class="visual-card-chip">{icon("card")}</div><div class="visual-card-code">•••• &nbsp; •••• &nbsp; •••• &nbsp; 2026</div><div class="visual-card-bottom"><span>每一份信任，皆有凭证</span><span>AUTHORIZED</span></div></div><div class="visual-status">{icon("check")} 统一管理 · 清晰可控</div></div>
       <div class="login-features"><span>{icon("card")} 灵活发卡</span><span>{icon("link")} 设备绑定</span><span>{icon("logs")} 全程留痕</span></div></div><div class="login-copyright">西塔 · 授权管理工作台</div></section>
       <main id="main" class="login-main"><div class="login-card"><span class="login-eyebrow">WELCOME BACK</span><h1>欢迎回来</h1><p class="login-subtitle">登录西塔工作台，开始今天的管理。</p>{error}
-      <form method="post" action="/login"><div class="field"><label class="field-label" for="username">管理员账号</label><input id="username" name="user" value="admin" autocomplete="username" required placeholder="请输入管理员账号"></div>
+      <form method="post" action="/login">{csrf_field()}<div class="field"><label class="field-label" for="username">管理员账号</label><input id="username" name="user" value="admin" autocomplete="username" required placeholder="请输入管理员账号"></div>
       <div class="field"><label class="field-label" for="password">登录密码</label><div class="password-field"><input id="password" name="pass" type="password" autocomplete="current-password" required placeholder="请输入管理密码"><button type="button" class="password-toggle" data-toggle-password="#password" aria-label="显示密码" aria-pressed="false">{icon("eye")}</button></div></div>
       <button class="button primary login-submit" type="submit">登录工作台 {icon("arrow")}</button></form><div class="login-footer">{icon("shield")} 仅限授权管理员访问</div></div><span class="login-bottom">XITA CONSOLE / 授权管理</span></main></div>''')
 
@@ -359,7 +499,7 @@ def view_dashboard():
     return page("概览", body, "admin")
 
 
-def view_cards(q="", st="", page_no=1):
+def view_cards(q="", st="", page_no=1, notice=""):
     per = 20
     where, args = [], []
     if q:
@@ -389,7 +529,7 @@ def view_cards(q="", st="", page_no=1):
         controls = action_form(r["card"], "renew:30", "+30 天", message="将这张卡密续期 30 天，确认继续？")
         controls += action_form(r["card"], "unbind", "解绑", message="解绑后，此卡密可在其他设备使用。确认解绑？")
         controls += action_form(r["card"], "unban" if r["status"] != "ok" else "ban", "解封" if r["status"] != "ok" else "封禁", "secondary" if r["status"] != "ok" else "danger", "确认调整这张卡密的封禁状态？")
-        trs += f'<tr><td><div class="card-cell"><a class="mono card-code" href="{url}">{card}</a>{copy_button(r["card"])}</div></td><td><span class="card-kind">{html.escape(r["kind"])}</span></td><td>{badge(r)}</td><td class="expiry-cell">{card_expiry(r)}</td><td><span class="mono machine-code">{html.escape(r["bound_machine"] or "未绑定")}</span></td><td class="log-time">{time.strftime("%m-%d %H:%M", time.localtime(r["created_at"]))}</td><td class="note-cell">{html.escape(r["note"] or "—")}</td><td><div class="table-actions">{controls}<a class="button ghost small" href="{url}">详情</a></div></td></tr>'
+        trs += f'<tr><td><input type="checkbox" class="row-check" name="sel" value="{card}" form="batch-form" aria-label="选择 {card}"></td><td><div class="card-cell"><a class="mono card-code" href="{url}">{card}</a>{copy_button(r["card"])}</div></td><td><span class="card-kind">{html.escape(r["kind"])}</span></td><td>{badge(r)}</td><td class="expiry-cell">{card_expiry(r)}</td><td><span class="mono machine-code">{html.escape(r["bound_machine"] or "未绑定")}</span></td><td class="log-time">{time.strftime("%m-%d %H:%M", time.localtime(r["created_at"]))}</td><td class="note-cell">{html.escape(r["note"] or "—")}</td><td><div class="table-actions">{controls}<a class="button ghost small" href="{url}">详情</a></div></td></tr>'
     shown = sorted({1, pages, *range(max(1, page_no - 2), min(pages, page_no + 2) + 1)})
     pager = []
     previous = 0
@@ -398,9 +538,13 @@ def view_cards(q="", st="", page_no=1):
             pager.append('<span class="muted">…</span>')
         pager.append('<a class="page-link %s" href="%s" %s>%d</a>' % ("active" if p == page_no else "", html.escape(list_url(p), quote=True), 'aria-current="page"' if p == page_no else "", p))
         previous = p
+    batch = f'''<form id="batch-form" class="toolbar batch-toolbar" method="post" action="/cards/batch" data-confirm="确认对所选卡密执行批量操作？">{csrf_field()}<label class="batch-check-all"><input type="checkbox" id="check-all" aria-label="全选本页"> 全选</label><span class="muted" id="batch-count">已选 0 张</span><select name="act" aria-label="批量操作"><option value="ban">批量封禁</option><option value="unban">批量解封</option><option value="unbind">批量解绑</option><option value="renew:30">批量续期 30 天</option><option value="renew:365">批量续期 365 天</option><option value="delete">批量删除</option></select><button class="button secondary small" type="submit">执行</button></form>'''
     body = heading("卡密管理", "查询与维护每一张卡密，掌握完整授权状态。", f'<a class="button secondary" href="/export.csv">{icon("download")} 导出全部</a><a class="button primary" href="/new">{icon("plus")} 生成卡密</a>')
+    if notice:
+        body += f'<div class="notice" role="status">{html.escape(notice)}</div>'
     body += f'''<section class="panel"><div class="tabs" aria-label="卡密状态">{tabs}</div><form class="toolbar" method="get" action="/cards"><div class="search-field"><span class="search-icon">{icon("search")}</span><input name="q" aria-label="搜索卡密、设备或备注" value="{html.escape(q, quote=True)}" placeholder="搜索卡密、设备标识或备注…"></div><input type="hidden" name="st" value="{st}"><button class="button primary" type="submit">搜索</button>{'<a class="button ghost" href="/cards">清空条件</a>' if q or st else ''}<span class="toolbar-count">共 <strong>{total:,}</strong> 张卡密</span></form>
-      <div class="table-scroll"><table><thead><tr><th>卡密 / 点击查看详情</th><th>授权类型</th><th>当前状态</th><th>有效期限</th><th>绑定设备</th><th>创建时间</th><th>备注</th><th>操作</th></tr></thead><tbody>{trs or empty_row(8, "没有找到匹配的卡密", "试试其他搜索条件，或生成你的第一批卡密。")}</tbody></table></div>
+      {batch}
+      <div class="table-scroll"><table><thead><tr><th style="width:36px"></th><th>卡密 / 点击查看详情</th><th>授权类型</th><th>当前状态</th><th>有效期限</th><th>绑定设备</th><th>创建时间</th><th>备注</th><th>操作</th></tr></thead><tbody>{trs or empty_row(9, "没有找到匹配的卡密", "试试其他搜索条件，或生成你的第一批卡密。")}</tbody></table></div>
       <div class="panel-footer"><span class="muted">第 {page_no} / {pages} 页 · 每页 {per} 条</span><nav class="pagination" aria-label="卡密分页">{'<a class="page-link" href="' + html.escape(list_url(page_no - 1), quote=True) + '">上一页</a>' if page_no > 1 else ''}{''.join(pager)}{'<a class="page-link" href="' + html.escape(list_url(page_no + 1), quote=True) + '">下一页</a>' if page_no < pages else ''}</nav></div></section>'''
     return page("卡密列表", body, "admin")
 
@@ -414,7 +558,7 @@ def view_new(msg="", values=None):
         types += f'<label class="type-option"><input type="radio" name="kind" value="{kind}" {"checked" if selected == kind else ""}><span class="type-icon">{icon(symbol)}</span><strong>{kind}</strong><small>{text}</small></label>'
     error = f'<div class="notice error" role="alert">{html.escape(msg)}</div>' if msg else ""
     body = heading("生成卡密", "选好授权方式，轻松创建新的一批卡密。", '<a class="button secondary" href="/cards">返回卡密列表</a>')
-    body += f'''<div class="form-layout"><section class="panel form-panel"><div class="panel-head"><div><h2 class="panel-title">配置授权</h2><p class="panel-description">一次最多生成 500 张，生成后可复制或下载。</p></div><span class="step-label">01 / 创建</span></div><form id="create-form" class="panel-body" method="post" action="/new">{error}
+    body += f'''<div class="form-layout"><section class="panel form-panel"><div class="panel-head"><div><h2 class="panel-title">配置授权</h2><p class="panel-description">一次最多生成 500 张，生成后可复制或下载。</p></div><span class="step-label">01 / 创建</span></div><form id="create-form" class="panel-body" method="post" action="/new">{csrf_field()}{error}
       <fieldset class="field type-field"><legend class="field-label">授权类型</legend><div class="type-options">{types}</div></fieldset>
       <div class="field-row"><div class="field"><label class="field-label" for="quantity">生成数量 <span class="required-mark">*</span></label><input id="quantity" name="num" type="number" min="1" max="500" step="1" value="{value('num', 10)}" required><span class="field-help">支持 1–500 张卡密</span></div>
       <div class="field" data-kind-field="时间卡" {'hidden' if selected != '时间卡' else ''}><label class="field-label" for="days">授权天数 <span class="required-mark">*</span></label><input id="days" name="days" type="number" min="1" max="36500" step="1" value="{value('days', 30)}" {'required' if selected == '时间卡' else 'disabled'}><div class="preset-row"><button class="preset" type="button" data-days="7">7 天</button><button class="preset" type="button" data-days="30">30 天</button><button class="preset" type="button" data-days="90">90 天</button><button class="preset" type="button" data-days="365">365 天</button></div></div>
@@ -453,10 +597,37 @@ def view_card_detail(card, notice=""):
     return page("卡密详情", body, "admin")
 
 
+def view_settings(msg="", err=""):
+    conf = load_conf()
+    body = heading("设置与安全", "修改管理密码，查看当前安全状态。", '<a class="button secondary" href="/">返回概览</a>')
+    if msg:
+        body += f'<div class="notice success" role="status">{icon("check")}{html.escape(msg)}</div>'
+    if err:
+        body += f'<div class="notice error" role="alert">{html.escape(err)}</div>'
+    rows = [
+        ("密码哈希算法", "PBKDF2-HMAC-SHA256（%d 轮 + 随机盐）" % PBKDF2_ROUNDS),
+        ("登录失败限制", "%d 次失败锁定 %d 分钟" % (LOGIN_MAX_FAIL, LOGIN_LOCK_SECONDS // 60)),
+        ("CSRF 防护", "同源自检 + 双提交 Token（表单隐藏域 csrf）"),
+        ("会话 Cookie", "HttpOnly + SameSite=Strict"),
+        ("校验接口限流", "每 IP 每分钟 %d 次" % API_MAX_PER_MIN),
+        ("配置文件权限", "config.json 已设为 600" if os.path.isfile(CONF) else "未生成"),
+    ]
+    info = "".join(f'<div class="detail-item"><dt>{k}</dt><dd>{v}</dd></div>' for k, v in rows)
+    body += f'''<div class="form-layout"><section class="panel form-panel"><div class="panel-head"><div><h2 class="panel-title">修改管理密码</h2><p class="panel-description">修改成功后所有会话立即失效，需要用新密码重新登录。</p></div><span class="step-label">SECURITY</span></div>
+      <form class="panel-body" method="post" action="/settings">{csrf_field()}
+      <div class="field"><label class="field-label" for="cur">当前密码 <span class="required-mark">*</span></label><input id="cur" name="cur" type="password" autocomplete="current-password" required></div>
+      <div class="field"><label class="field-label" for="new1">新密码 <span class="required-mark">*</span></label><input id="new1" name="new" type="password" autocomplete="new-password" minlength="8" required><span class="field-help">至少 8 位，建议 12 位以上混合大小写与数字。</span></div>
+      <div class="field"><label class="field-label" for="new2">确认新密码 <span class="required-mark">*</span></label><input id="new2" name="new2" type="password" autocomplete="new-password" minlength="8" required></div>
+      <div class="form-submit"><button class="button primary" type="submit">{icon("shield")} 保存并重新登录</button></div></form></section>
+      <aside class="help-panel"><section class="panel"><div class="panel-head"><h2 class="panel-title">当前安全状态</h2>{icon("shield")}</div><dl class="detail-grid">{info}</dl></section>
+      <div class="help-note">{icon("logs")}<div><strong>公网访问提示</strong><p>后台走 HTTP 明文时，建议只在云安全组放行自己的 IP，或改用 SSH 隧道访问。</p></div></div></aside></div>'''
+    return page("设置", body, "admin")
+
+
 def view_logs():
     with db() as conn:
         rows = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 200").fetchall()
-    body = heading("操作日志", "每一次验证与变更，都有记录可查。", '<a class="button secondary" href="/logs">刷新记录</a>')
+    body = heading("操作日志", "每一次验证与变更，都有记录可查。", f'<a class="button secondary" href="/logs.csv">{icon("download")} 导出日志</a><a class="button secondary" href="/logs">刷新记录</a>')
     body += f'''<section class="panel"><div class="panel-head"><div><h2 class="panel-title">最近活动记录</h2><p class="panel-description">显示最近 200 条记录；搜索仅筛选当前记录。</p></div><span class="badge neutral"><span id="log-count">{len(rows)}</span> 条记录</span></div><div class="toolbar"><div class="search-field"><span class="search-icon">{icon("search")}</span><input type="search" data-filter-log aria-label="筛选当前日志" placeholder="搜索卡密、设备或操作说明…"></div></div><div class="table-scroll"><table><thead><tr><th>发生时间</th><th>关联卡密</th><th>设备标识</th><th>动作</th><th>说明</th></tr></thead><tbody>{log_rows(rows)}<tr data-log-empty hidden><td colspan="5"><div class="empty-state"><strong>没有匹配的记录</strong><span>试试其他关键词。</span></div></td></tr></tbody></table></div></section>'''
     return page("日志", body, "admin")
 
@@ -502,6 +673,23 @@ class H(BaseHTTPRequestHandler):
         m = c.get("sess")
         return bool(m) and token_ok(m.value)
 
+    def _csrf_cookie(self):
+        return ("Set-Cookie", "csrf=%s; Path=/; SameSite=Strict" % csrf_token())
+
+    def _same_origin(self):
+        """同源校验：浏览器跨站 POST 必带 Origin/Referer，不同源直接拒"""
+        host = (self.headers.get("Host") or "").lower()
+        for h in ("Origin", "Referer"):
+            v = self.headers.get(h)
+            if v:
+                netloc = urllib.parse.urlparse(v).netloc.lower()
+                return netloc == host
+        return True   # 没有 Origin/Referer 的（命令行/脚本）放行，靠 CSRF token 兜底
+
+    def _csrf_ok(self, f):
+        got = f.get("csrf", [""])[0]
+        return bool(got) and hmac.compare_digest(got, csrf_token())
+
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n).decode("utf-8", "replace") if n else ""
@@ -519,35 +707,52 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("/api/verify"):
             return self.api_verify(qs)
         if p == "/login":
-            return self._send(200, view_login())
+            return self._send(200, view_login(), extra=[self._csrf_cookie()])
         if not self._cookie_ok():
             return self._redirect("/login")
         if p in ("/", ""):
-            return self._send(200, view_dashboard())
+            return self._send(200, view_dashboard(), extra=[self._csrf_cookie()])
         if p == "/cards":
             return self._send(200, view_cards(qs.get("q", [""])[0], qs.get("st", [""])[0],
-                                              qs.get("p", ["1"])[0]))
+                                              qs.get("p", ["1"])[0], qs.get("notice", [""])[0]), extra=[self._csrf_cookie()])
         if p == "/new":
-            return self._send(200, view_new())
+            return self._send(200, view_new(), extra=[self._csrf_cookie()])
         if p == "/logs":
-            return self._send(200, view_logs())
+            return self._send(200, view_logs(), extra=[self._csrf_cookie()])
+        if p == "/logs.csv":
+            return self.export_logs_csv()
+        if p == "/settings":
+            return self._send(200, view_settings(qs.get("msg", [""])[0]), extra=[self._csrf_cookie()])
         if p == "/export.csv":
             return self.export_csv()
         if p.startswith("/card/"):
             card = urllib.parse.unquote(p[len("/card/"):])
-            return self._send(200, view_card_detail(card, qs.get("notice", [""])[0]))
+            return self._send(200, view_card_detail(card, qs.get("notice", [""])[0]), extra=[self._csrf_cookie()])
         if p == "/logout":
-            return self._redirect("/login", [("Set-Cookie", "sess=; Path=/; Max-Age=0")])
+            return self._redirect("/login", [("Set-Cookie", "sess=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")])
         self._send(404, page("404", "<div class=card>页面不存在</div>", "admin"))
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         p = u.path
+        ip = self.client_address[0]
         f = self._body()
+        # ① 同源校验（CSRF 第一道）
+        if not self._same_origin():
+            return self._send(403, page("403", '<div class="panel" style="margin:40px auto;max-width:520px"><h2>拒绝跨站请求</h2><p class="muted">来源与本站不一致，操作已被拦截。</p></div>', None))
+        # ② CSRF token（第二道）
+        if not self._csrf_ok(f):
+            return self._send(403, page("403", '<div class="panel" style="margin:40px auto;max-width:520px"><h2>校验失败</h2><p class="muted">缺少或错误的 CSRF token，请刷新页面重试。</p></div>', None))
         if p == "/login":
+            if login_locked(ip):
+                return self._send(429, view_login("尝试次数过多，请 %d 分钟后再试。" % (LOGIN_LOCK_SECONDS // 60)),
+                                  extra=[self._csrf_cookie()])
             if check_password(f.get("pass", [""])[0]) and f.get("user", ["admin"])[0] == "admin":
-                return self._redirect("/", [("Set-Cookie", "sess=%s; Path=/; HttpOnly" % make_token())])
-            return self._send(200, view_login("账号或密码不对"))
+                login_reset(ip)
+                return self._redirect("/", [("Set-Cookie", "sess=%s; Path=/; HttpOnly; SameSite=Strict" % make_token()),
+                                            self._csrf_cookie()])
+            login_fail(ip)
+            return self._send(200, view_login("账号或密码不对"), extra=[self._csrf_cookie()])
         if not self._cookie_ok():
             return self._redirect("/login")
         if p == "/new":
@@ -566,27 +771,76 @@ class H(BaseHTTPRequestHandler):
                 if len(note) > 200:
                     raise ValueError
             except ValueError:
-                return self._send(400, view_new("请检查输入：数量为 1–500；时间卡天数、点数卡点数须为正整数，备注最多 200 字。", values))
+                res = self._send(400, view_new("请检查输入：数量为 1–500；时间卡天数、点数卡点数须为正整数，备注最多 200 字。", values),
+                                 extra=[self._csrf_cookie()])
+                return res
             made = create_cards(num, kind, days, points, note)
-            return self._send(200, view_created(made))
+            return self._send(200, view_created(made), extra=[self._csrf_cookie()])
+        if p == "/cards/batch":
+            act = f.get("act", [""])[0]
+            sel = f.get("sel", [])
+            if not sel:
+                return self._redirect("/cards?notice=" + urllib.parse.quote("没有选中任何卡密"))
+            try:
+                done, skipped, msg = do_batch(sel, act)
+            except ValueError as exc:
+                return self._send(400, view_cards(notice=str(exc)), extra=[self._csrf_cookie()])
+            return self._redirect("/cards?notice=" + urllib.parse.quote(msg))
+        if p == "/settings":
+            cur = f.get("cur", [""])[0]
+            new = f.get("new", [""])[0]
+            new2 = f.get("new2", [""])[0]
+            if not check_password(cur):
+                return self._send(400, view_settings(err="当前密码不正确。"), extra=[self._csrf_cookie()])
+            if len(new) < 8:
+                return self._send(400, view_settings(err="新密码至少 8 位。"), extra=[self._csrf_cookie()])
+            if new != new2:
+                return self._send(400, view_settings(err="两次输入的新密码不一致。"), extra=[self._csrf_cookie()])
+            if new == cur:
+                return self._send(400, view_settings(err="新密码不能与当前密码相同。"), extra=[self._csrf_cookie()])
+            set_password(new)
+            return self._redirect("/login", [("Set-Cookie", "sess=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
+                                             self._csrf_cookie()])
         if p.startswith("/card/") and p.endswith("/act"):
             card = urllib.parse.unquote(p[len("/card/"):-len("/act")])
             act = f.get("act", [""])[0]
-            message = do_action(card, act)
+            try:
+                message = do_action(card, act)
+            except ValueError as exc:
+                return self._send(400, view_card_detail(card, str(exc)), extra=[self._csrf_cookie()])
             return self._redirect("/card/" + urllib.parse.quote(card, safe="") + "?notice=" + urllib.parse.quote(message))
         self._send(404, page("404", "<div class=card>页面不存在</div>", "admin"))
 
     # --- 接口 ---
     def api_verify(self, qs):
+        ip = self.client_address[0]
+        if not api_allowed(ip):
+            return self._send(429, json.dumps({"ok": False, "msg": "请求过于频繁，请稍后再试."}, ensure_ascii=False),
+                              "application/json; charset=utf-8")
         card = qs.get("card", [""])[0]
         machine = qs.get("machine", [""])[0]
         if not card:
             return self._send(400, json.dumps({"ok": False, "msg": "缺少 card"}, ensure_ascii=False),
                               "application/json; charset=utf-8")
+        if not machine or not machine.strip():
+            return self._send(400, json.dumps({"ok": False, "msg": "缺少 machine"}, ensure_ascii=False),
+                              "application/json; charset=utf-8")
         ok, msg, extra = verify_card(card, machine)
         out = {"ok": ok, "msg": msg}
         out.update(extra)
         self._send(200, json.dumps(out, ensure_ascii=False), "application/json; charset=utf-8")
+
+    def export_logs_csv(self):
+        with db() as conn:
+            rows = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 5000").fetchall()
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["时间", "卡密", "设备标识", "动作", "说明"])
+        for r in rows:
+            w.writerow([fmt_ts(r["ts"]), r["card"] or "", r["machine"] or "", r["action"] or "", r["detail"] or ""])
+        data = buf.getvalue().encode("utf-8-sig")
+        self._send(200, data, "text/csv; charset=utf-8",
+                   [("Content-Disposition", 'attachment; filename="logs.csv"')])
 
     def export_csv(self):
         with db() as conn:
