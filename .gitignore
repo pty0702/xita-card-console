@@ -1,0 +1,20 @@
+# 运行数据、凭据与本机产物不进入版本库。
+__pycache__/
+*.py[cod]
+*.db
+*.db-*
+*.sqlite*
+*.log
+*.exe
+*.bin
+*.spec
+*.ini
+license.dat
+keys/
+admin/config.json
+admin/local.*.txt
+server/data/
+build*/
+dist*/
+artifacts/
+运维-*.md
