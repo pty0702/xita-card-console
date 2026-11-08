@@ -4,7 +4,7 @@
 西塔验证壳 · 客户端壳（登录界面 + 加密通讯 + 释放并启动被保护程序）
 
 特点（和"origin2026激活补丁"同款体验）：
-  * 卡密框 / 公告栏 / 记住卡密 / 自动登录 / 换绑
+  * 卡密框 / 公告栏 / 记住卡密（下次启动自动填入并自动验证）/ 换绑
   * 机器码取 C: 卷序列号
   * 时间/永久/试用卡登录成功写服务器签名的 SIG2 授权，点数卡每次在线验证
   * 真正的程序是加密的 payload.bin，验证通过才解密释放并启动
@@ -261,10 +261,12 @@ def run_gui():
     entry = tk.Entry(root, textvariable=var_card, width=40)
     entry.place(x=50, y=168)
 
-    var_remember = tk.BooleanVar(value=cfg.get("记住用户") == "真")
-    var_auto = tk.BooleanVar(value=cfg.get("自动登录") == "真")
-    tk.Checkbutton(root, text="记住卡密", variable=var_remember).place(x=20, y=200)
-    tk.Checkbutton(root, text="自动登录", variable=var_auto).place(x=200, y=200)
+    # 记住卡密：勾选后本次登录成功即保存卡密，下次启动自动填入并自动验证。
+    # 兼容旧配置：老版本把「自动登录」单独存一个键，这里一并视为已记住。
+    var_remember = tk.BooleanVar(
+        value=(cfg.get("记住用户") == "真" or cfg.get("自动登录") == "真"))
+    tk.Checkbutton(root, text="记住卡密（下次自动验证）",
+                   variable=var_remember).place(x=20, y=200)
 
     status = tk.StringVar(value="机器码：" + mc)
     tk.Label(root, textvariable=status, fg="#666").place(x=10, y=275)
@@ -307,7 +309,7 @@ def run_gui():
                 status.set(info)
                 return
             cfg2 = {"记住用户": "真" if var_remember.get() else "假",
-                    "自动登录": "真" if var_auto.get() else "假",
+                    "自动登录": "真" if var_remember.get() else "假",
                     "卡号": card if var_remember.get() else ""}
             write_ini(cfg2)
             messagebox.showinfo("信息：", txt.replace("|", "\n"))
@@ -345,9 +347,9 @@ def run_gui():
             txt = "失败：%s" % e
         messagebox.showinfo("信息：", txt)
 
-    # 自动登录 / 离线启动
+    # 自动验证 / 离线启动
     lic = load_license(mc)
-    if var_auto.get() and var_card.get():
+    if var_remember.get() and var_card.get():
         root.after(800, lambda: do_login(var_card.get(), silent=True))
     elif lic:
         def start_offline():
